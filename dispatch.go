@@ -105,6 +105,11 @@ func (st *subState) resetForResume() chan *Delivery {
 	defer st.mu.Unlock()
 	newCh := make(chan *Delivery, st.queueN)
 	old := st.guard.replace(newCh)
+	// 更换中止点：旧 abortCh 关闭以解除旧通道上的在途阻塞发送。
+	if st.abortCh != nil {
+		close(st.abortCh)
+	}
+	st.abortCh = make(chan struct{})
 	for _, qm := range st.pending {
 		qm.inCh = false
 		qm.delivered = false
@@ -234,13 +239,21 @@ func (b *Bus) dispatchLoop(st *subState) {
 		// 锁内决策：取出下一条；无消息可发时按协议在锁内等待。
 		st.mu.Lock()
 		nextSeq, ch, d, red, redeliv, exitSel := b.selectLocked(st)
+		if !exitSel {
+			// 锁内登记在途发送：resume/close 关通道前会等待其归零，
+			// 而它们换 abortCh/置 closed 也在同一把锁下，不存在
+			// “已关闭仍新增发送”的窗口。
+			st.sendWg.Add(1)
+		}
+		abort := st.abortCh
 		st.mu.Unlock()
 		if exitSel {
 			return
 		}
 
 		// 锁外阻塞发送：通道满则挂起但不持锁，消费者可自由读走，
-		// 不需要任何“读槽”信号也不会死锁。
+		// 不需要任何“读槽”信号也不会死锁；resume/close 关闭 abortCh
+		// 可立即解除本次发送（随后按未送出处理并重排）。
 		sent := true
 		func() {
 			defer func() {
@@ -248,9 +261,22 @@ func (b *Bus) dispatchLoop(st *subState) {
 					sent = false
 				}
 			}()
-			ch <- d
+			if abort == nil {
+				select {
+				case ch <- d:
+				default:
+					sent = false
+				}
+				return
+			}
+			select {
+			case ch <- d:
+			case <-abort:
+				sent = false
+			}
 		}()
 
+		st.sendWg.Done()
 		exitNow := false
 		st.mu.Lock()
 		if redeliv && sent {
@@ -332,6 +358,7 @@ func envelopeToMessage(env *Envelope) *Message {
 		Topic:   env.Topic,
 		Version: env.Version,
 		Seq:     env.Seq,
+		Key:     env.Key,
 		Payload: env.Body,
 	}
 }

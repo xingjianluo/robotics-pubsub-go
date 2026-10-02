@@ -73,3 +73,41 @@ func Example() {
 	// received seq 1
 	// drop reason: no-subscriber
 }
+
+// ExampleBus_JoinGroup 演示执行器组：同一主题下多个执行器分担任务，
+// 同一机器人（Key）的消息保持顺序，掉线成员的未确认工作被转派。
+func ExampleBus_JoinGroup() {
+	bus := pubsub.New(pubsub.BusConfig{DefaultQueueLen: 8}, nil)
+	defer bus.Close()
+	ctx := context.Background()
+
+	worker, err := bus.JoinGroup(ctx, "robot/cmd", "executors", pubsub.GroupOption{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("worker joined:", worker.ID(), "group:", worker.Group())
+
+	// 带顺序键发布：同一 robot-7 的命令在组内严格按序执行。
+	res, err := bus.PublishKeyed(ctx, "robot/cmd", "robot-7", pubsub.QoSReliable,
+		map[string]string{"op": "move"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("published seq", res.Seq, "to groups:", res.GroupDelivered)
+
+	d := <-worker.Messages()
+	fmt.Println("executing seq", d.Msg.Seq, "for", d.Msg.Key)
+	if err := worker.Ack(d.Msg.Seq); err != nil {
+		log.Fatal(err)
+	}
+
+	// 查看死信队列（本例为空）。
+	dead, _ := bus.DeadLetters("robot/cmd", "executors")
+	fmt.Println("dead letters:", len(dead))
+
+	// Output:
+	// worker joined: executors/m-1 group: executors
+	// published seq 1 to groups: 1
+	// executing seq 1 for robot-7
+	// dead letters: 0
+}

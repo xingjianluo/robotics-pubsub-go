@@ -17,6 +17,12 @@ import (
 // QoSLowLatency：绝不阻塞；队列满则丢弃并在结果中给出 DropQueueFull，
 // 无在线订阅者给出 DropNoSubscriber。
 func (b *Bus) Publish(ctx context.Context, topic string, qos QoS, payload any) (*PublishResult, error) {
+	return b.PublishKeyed(ctx, topic, "", qos, payload)
+}
+
+// PublishKeyed 同 Publish，但携带顺序键 key（机器人/任务 ID）：
+// 执行器组内相同 key 的消息严格按发布顺序投递；普通订阅忽略该键。
+func (b *Bus) PublishKeyed(ctx context.Context, topic, key string, qos QoS, payload any) (*PublishResult, error) {
 	if topic == "" {
 		return nil, newError(KindInvalidArgument, "", "empty topic", nil)
 	}
@@ -48,11 +54,16 @@ func (b *Bus) Publish(ctx context.Context, topic string, qos QoS, payload any) (
 		}
 		body = raw
 	}
-	return b.dispatchPublish(ctx, topic, ver, qos, body)
+	return b.dispatchPublish(ctx, topic, key, ver, qos, body)
 }
 
 // PublishRaw 发布已编码的原始字节（绕过 JSON codec；帧/投递层仍生效）。
 func (b *Bus) PublishRaw(ctx context.Context, topic string, v Version, qos QoS, body []byte) (*PublishResult, error) {
+	return b.PublishRawKeyed(ctx, topic, "", v, qos, body)
+}
+
+// PublishRawKeyed 同 PublishRaw，但携带顺序键 key（供执行器组按序分担）。
+func (b *Bus) PublishRawKeyed(ctx context.Context, topic, key string, v Version, qos QoS, body []byte) (*PublishResult, error) {
 	if topic == "" {
 		return nil, newError(KindInvalidArgument, "", "empty topic", nil)
 	}
@@ -65,10 +76,10 @@ func (b *Bus) PublishRaw(ctx context.Context, topic string, v Version, qos QoS, 
 	if closed {
 		return nil, newError(KindClosed, topic, "bus already closed", nil)
 	}
-	return b.dispatchPublish(ctx, topic, v, qos, body)
+	return b.dispatchPublish(ctx, topic, key, v, qos, body)
 }
 
-func (b *Bus) dispatchPublish(ctx context.Context, topic string, ver Version, qos QoS, body []byte) (*PublishResult, error) {
+func (b *Bus) dispatchPublish(ctx context.Context, topic, key string, ver Version, qos QoS, body []byte) (*PublishResult, error) {
 	// 同一主题的发布在此锁下串行：保证“分配序号 -> 入队”原子，
 	// 该主题的未确认序号集合连续，调度器不会把暂时未入队的序号误判
 	// 为已确认空洞。等待背压有界（受 ctx/超时约束），不会永久阻塞；
@@ -83,10 +94,11 @@ func (b *Bus) dispatchPublish(ctx context.Context, topic string, ver Version, qo
 		Topic:   topic,
 		Version: ver,
 		Seq:     seq,
+		Key:     key,
 		Body:    body,
 	}
 
-	// 订阅关系快照：在总线读锁下取得，订阅增删改对发布立即可见且一致。
+	// 订阅关系与执行器组快照：在总线读锁下取得，增删改对发布立即可见。
 	b.mu.RLock()
 	if b.closed {
 		b.mu.RUnlock()
@@ -97,11 +109,15 @@ func (b *Bus) dispatchPublish(ctx context.Context, topic string, ver Version, qo
 	for _, st := range subs {
 		snap = append(snap, st)
 	}
+	gsnap := make([]*groupState, 0, len(b.groups[topic]))
+	for _, g := range b.groups[topic] {
+		gsnap = append(gsnap, g)
+	}
 	b.mu.RUnlock()
 
 	res := &PublishResult{Topic: topic, Seq: seq}
 
-	if len(snap) == 0 {
+	if len(snap) == 0 && len(gsnap) == 0 {
 		if qos == QoSLowLatency {
 			// 低延迟：无订阅者不是错误，给出可区分原因。
 			res.Dropped = append(res.Dropped, DropInfo{Reason: DropNoSubscriber})
@@ -156,7 +172,70 @@ func (b *Bus) dispatchPublish(ctx context.Context, topic string, ver Version, qo
 			res.Delivered++
 		}
 	}
+
+	// 执行器组投递：组是可靠语义载体，消息在组内只由一个成员接手。
+	for _, g := range gsnap {
+		if qos == QoSLowLatency {
+			// 低延迟发布绝不阻塞：组积压未满则入队，满则给出可区分丢弃。
+			g.mu.Lock()
+			if g.closed {
+				g.mu.Unlock()
+				continue
+			}
+			if len(g.pending) >= g.maxPending {
+				g.mu.Unlock()
+				res.Dropped = append(res.Dropped, DropInfo{
+					SubscriptionID: "group:" + g.name, Reason: DropQueueFull,
+				})
+				continue
+			}
+			g.enqueueLocked(env)
+			g.mu.Unlock()
+			res.GroupDelivered++
+			continue
+		}
+		// 可靠发布：组积压超限时做有界等待（受 ctx/配置超时约束），
+		// 只阻塞本主题本次发布，不影响其他主题的发布者。
+		if err := b.waitGroupWindow(ctx, g); err != nil {
+			return nil, newError(KindOverflow, topic,
+				fmt.Sprintf("group %s backlog timeout at seq=%d", g.name, seq), err)
+		}
+		g.mu.Lock()
+		if !g.closed {
+			g.enqueueLocked(env)
+			res.GroupDelivered++
+		}
+		g.mu.Unlock()
+	}
 	return res, nil
+}
+
+// waitGroupWindow 等待执行器组积压降到上限之下（Ack/判死推进）。
+func (b *Bus) waitGroupWindow(ctx context.Context, g *groupState) error {
+	timeout := time.Duration(b.cfg.ReliableEnqueueTimeoutMs) * time.Millisecond
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		g.mu.Lock()
+		closed := g.closed
+		full := len(g.pending) >= g.maxPending
+		g.mu.Unlock()
+		if closed {
+			return fmt.Errorf("group %s closed", g.name)
+		}
+		if !full {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("group enqueue timeout after %s", timeout)
+		case <-tick.C:
+		}
+	}
 }
 
 // waitForWindow 等待订阅者未完成消息数小于容量（Ack/消费推进）。

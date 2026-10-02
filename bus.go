@@ -12,14 +12,23 @@ type BusConfig struct {
 	ReliableEnqueueTimeoutMs int
 	// RedeliveryTimeoutMs 在途未确认消息的重发间隔（模拟会话续传）。
 	RedeliveryTimeoutMs int
+	// GroupMaxPending 执行器组默认积压上限（组内未确认消息总数）。
+	GroupMaxPending int
+	// GroupDeliveryTimeoutMs 组内消息默认投递超时：入组后超过该时长
+	// 仍未被确认则判失败并进入死信队列。
+	GroupDeliveryTimeoutMs int
+	// GroupMaxAttempts 组内消息默认最大投递尝试次数，超过判失败进死信队列。
+	GroupMaxAttempts int
 }
 
 // PublishResult 发布结论：低延迟等级丢弃时给出可区分原因。
 type PublishResult struct {
 	Topic     string
 	Seq       uint64
-	Delivered int        // 已入队的在线订阅者数
-	Dropped   []DropInfo // 丢弃明细（低延迟等级）
+	Delivered int // 已入队的在线订阅者数
+	// GroupDelivered 本次发布成功入队的执行器组数（可靠语义）。
+	GroupDelivered int
+	Dropped        []DropInfo // 丢弃明细（低延迟等级）
 }
 
 // DropInfo 单个订阅者的丢弃信息。
@@ -56,6 +65,12 @@ type subState struct {
 	offline   bool
 	closed    bool
 	redelivMs int
+
+	// abortCh 用于解除投递协程在“当前通道”上的阻塞发送：
+	// resume/关闭时先关闭它让在途发送退出，再安全关闭旧通道。
+	abortCh chan struct{}
+	// sendWg 在途发送计数：关闭通道前等待其归零，消除 close/send 竞态。
+	sendWg sync.WaitGroup
 }
 
 // Bus 进程内消息总线（回环模拟发布订阅链路）。
@@ -65,9 +80,10 @@ type Bus struct {
 	frame *frameCodec
 
 	mu         sync.RWMutex
-	topicLocks map[string]*sync.Mutex          // 每主题发布串行锁
-	topics     map[string]map[string]*subState // topic -> subID -> state
-	byID       map[string]*subState            // subID -> state（续传查找）
+	topicLocks map[string]*sync.Mutex            // 每主题发布串行锁
+	topics     map[string]map[string]*subState   // topic -> subID -> state
+	byID       map[string]*subState              // subID -> state（续传查找）
+	groups     map[string]map[string]*groupState // topic -> group -> state
 	schemas    map[string]Schema
 	seqMu      sync.Mutex
 	seqs       map[string]uint64 // topic -> 单调递增序号
@@ -87,6 +103,15 @@ func New(cfg BusConfig, codec Codec) *Bus {
 	if cfg.RedeliveryTimeoutMs <= 0 {
 		cfg.RedeliveryTimeoutMs = 2000
 	}
+	if cfg.GroupMaxPending <= 0 {
+		cfg.GroupMaxPending = 256
+	}
+	if cfg.GroupDeliveryTimeoutMs <= 0 {
+		cfg.GroupDeliveryTimeoutMs = 5000
+	}
+	if cfg.GroupMaxAttempts <= 0 {
+		cfg.GroupMaxAttempts = 5
+	}
 	if codec == nil {
 		codec = NewJSONCodec()
 	}
@@ -97,6 +122,7 @@ func New(cfg BusConfig, codec Codec) *Bus {
 		topics:     map[string]map[string]*subState{},
 		topicLocks: map[string]*sync.Mutex{},
 		byID:       map[string]*subState{},
+		groups:     map[string]map[string]*groupState{},
 		schemas:    map[string]Schema{},
 		seqs:       map[string]uint64{},
 	}

@@ -12,6 +12,9 @@ type Message struct {
 	Payload []byte
 	// Seq 是该消息在主题内的单调递增序号，由总线在发布时分配。
 	Seq uint64
+	// Key 是顺序键（如机器人 ID / 任务 ID）：执行器组内相同 Key 的
+	// 消息严格按发布顺序投递；普通订阅不使用该字段（为空）。
+	Key string
 }
 
 // Envelope 是编码后的线上形态（仅内部使用）。
@@ -20,6 +23,7 @@ type Envelope struct {
 	Topic   string
 	Version Version
 	Seq     uint64
+	Key     string
 	Body    []byte
 }
 

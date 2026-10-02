@@ -85,6 +85,7 @@ func (b *Bus) newSubStateLocked(topic string, qos QoS, queueN int) *subState {
 		ch:        ch,
 		guard:     &chGuard{ch: ch},
 		waitCh:    make(chan struct{}),
+		abortCh:   make(chan struct{}),
 		pending:   map[uint64]*queuedMsg{},
 		redelivMs: b.cfg.RedeliveryTimeoutMs,
 	}
@@ -103,8 +104,16 @@ func (b *Bus) removeSubscription(s *Subscription) error {
 	st.offline = false
 	st.pending = map[uint64]*queuedMsg{}
 	ch := st.guard.get()
+	abort := st.abortCh
+	st.abortCh = nil
 	st.signalLocked()
 	st.mu.Unlock()
+	// 先让在途阻塞发送退出并归零，再关闭通道（消除 close/send 竞态）。
+	if abort != nil {
+		close(abort)
+	}
+	st.sendWg.Wait()
+	safeCloseCh(ch)
 
 	b.mu.Lock()
 	if subs := b.topics[st.topic]; subs != nil {
@@ -115,9 +124,6 @@ func (b *Bus) removeSubscription(s *Subscription) error {
 	}
 	delete(b.byID, st.id)
 	b.mu.Unlock()
-
-	// 关闭当前通道：dispatchLoop 退出，消费方收到通道关闭。
-	safeCloseCh(ch)
 	return nil
 }
 
@@ -137,9 +143,11 @@ func (b *Bus) setOffline(s *Subscription, offline bool) error {
 	st.signalLocked()
 	st.mu.Unlock()
 	if !offline {
-		// resume：重建投递通道，未 Ack 消息全部重置为待投递，
-		// 关闭旧通道以解除投递协程可能的阻塞发送。
+		// resume：重建投递通道，未 Ack 消息全部重置为待投递；
+		// resetForResume 已关闭旧 abortCh 解除在途阻塞发送，
+		// 等其归零后再关闭旧通道（消除 close/send 竞态）。
 		old := st.resetForResume()
+		st.sendWg.Wait()
 		safeCloseCh(old)
 	}
 	return nil
