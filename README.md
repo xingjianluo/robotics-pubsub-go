@@ -4,6 +4,14 @@
 发布者与订阅者之间的消息传递，目标是让不同服务质量（QoS）与订阅状态下的
 投递结论**一致、可解释、可复现**。
 
+支持两类消费模型：
+
+1. **独立订阅**：每个订阅者收到全量副本（广播），带两级 QoS、会话续传；
+2. **多执行器分担组（Executor Group）**：同一主题下多个执行器竞争消费，
+   一条消息同一时刻只交给一个执行器；掉线自动转接/回来续做；按
+   “机器人 ID / 任务 ID”做同 Key 严格有序；积压超限与等待/处理超时
+   分别给出可区分失败结果并进入可查看、可重投的死信队列。
+
 无外部中间件依赖，仅用 Go 标准库；所有正确性结论都有单测与
 `go test -race` 覆盖。
 
@@ -92,7 +100,108 @@
 
 ---
 
-## 3. 消息编码与版本兼容
+## 3. 多执行器分担（Executor Group / Competing Executors）
+
+面向真实机器人调度的用法：**同一主题的同一个分担组下同时挂多个执行器**，
+一起分担该主题上的任务。
+
+```go
+g, _   := bus.CreateExecutorGroup(ctx, "robot/cmd", "line-A", pubsub.GroupConfig{
+    MaxBacklog:       256,  // 组内保留（排队 + 在途未 Ack）上限
+    ExecutorQueueLen: 16,   // 每个执行器的在途窗口
+    ProcessTimeoutMs: 5000, // 接手后处理超时
+    WaitTimeoutMs:    30000,// 排队等待接手超时
+    MaxAttempts:      3,    // 最多派发次数（含转接）
+})
+ex, _  := g.Join(ctx, pubsub.ExecutorOption{})             // 执行器上线
+res, _ := bus.PublishToGroup(ctx, "robot/cmd", "line-A",
+    pubsub.QoSReliable, payload, &pubsub.ExecutorGroupKey{Key: "robot-7"})
+d := <-ex.Messages()
+_ = ex.Ack(d.Msg.Seq)
+_ = ex.Leave(ctx)                                          // 执行器掉线
+ex2, _ := g.Join(ctx, pubsub.ExecutorOption{ResumeID: ex.ID()}) // 回来续做
+```
+
+### 3.1 竞争消费：一条消息同时刻只属于一个执行器
+
+- 组是一个 **competing consumers** 域：每条消息同一时刻只派发给**唯一一个**
+  执行器，不会被几个执行器同时拿走（`TestExecCompetingConsumers` 用
+  “seq -> 唯一属主”表断言）。
+- 多个在线执行器按 round-robin 公平分担；执行器有独立的在途窗口
+  （`ExecutorQueueLen`），派发只在有空槽时发生。
+- 派发是组内单协程完成的，且“**选活 → 打租约 → 入通道**”在同一把组锁的
+  临界区内完成（槽位由在途计数保证，入通道不阻塞），因此从根上不存在
+  “租约已打、执行器却已离开”的窗口，也就不会同一条被两人同时拿到。
+
+### 3.2 掉线切换与会话续传保证到什么程度
+
+执行器生命周期与订阅者类似：
+`Join(active) ──Leave──▶ offline ──Join(ResumeID)──▶ active ──Close──▶ removed`
+
+- **Leave（掉线）**：立即释放它持有的全部未 Ack 租约。组内还有其他在线
+  执行器时，这些活会**立即转接**给在线者（投递记录 `Attempt` 递增）；
+  没有在线者时消息**原样保留在组内**，等它（或后来者）上线继续，
+  主题不会被堵死。
+- **Join(ResumeID)（回来续做）**：以相同身份重新接入并重建接收通道；
+  掉线期间新发布到组里的消息与它未完成的消息都会继续派发。
+- **保证边界**：
+  - 未 Ack 的消息**不会静默丢失**（保留在组内直到 Ack / 进入死信）；
+  - 已 Ack 的消息立即从组内保留集合删除，**绝不再次派发**；
+  - 掉线转接属于 at-least-once：若执行器在 Ack 与租约释放的竞态中实际
+    已完成但确认迟到，转接副本可能再次出现，消费方需按 `Msg.Seq` 幂等。
+- Close 是永久退出（身份不可续），未 Ack 消息同样转接/保留。
+
+### 3.3 顺序保证：同一机器人/同一任务（同 Key）严格有序
+
+- 发布时可用 `*ExecutorGroupKey{Key: robotOrTaskID}` 声明顺序键
+  （`PublishRawToGroup` 直接传 key 字符串）；未声明归入默认键。
+- **同一个 Key 的消息严格按发布先后处理**：每个 Key 维护一条有序队列，
+  只要队头消息还在某个执行器手上（未 Ack），同 Key 的后续消息一律等待，
+  因此即使中途换执行器、成员数量变化，顺序也不会被打乱。
+- **不同 Key 之间允许并行**分担（不同机器人/任务互不阻塞）。
+- 等待超时/转接的副本只针对当前队头，重发不会插到同 Key 更新的消息之前。
+- 注意保证范围是**每个 Key 内**；不声明 Key 或不同 Key 之间不保证全局顺序
+  （那本来就是为了并行分担）。
+
+### 3.4 容量上限与失败语义（三类结果彼此可区分）
+
+组发布**从不为“等执行器处理”而阻塞发布者**，积压与超时都有明确归宿：
+
+| 情形 | 可靠发布 (`QoSReliable`) | 低延迟发布 (`QoSLowLatency`) | 消息归宿 |
+| ---- | ------------------------ | ----------------------------- | -------- |
+| 组内积压达到 `MaxBacklog` | 返回 `KindOverflow` | 不阻塞，`Dropped=[{DropQueueFull}]` | 死信 `DeadBacklogOverflow` |
+| 排队等待接手超过 `WaitTimeoutMs`（始终无执行者接手） | 死信 `DeadWaitTimeout` | 同左 | 死信 `DeadWaitTimeout` |
+| 接手后超过 `ProcessTimeoutMs` 未 Ack | 先转接重派；达到 `MaxAttempts` 仍未 Ack → 死信 | 同左（组内派发始终 at-least-once） | 死信 `DeadProcessTimeout` |
+| 目标组不存在 | 返回 `KindNoSubscriber` | `Dropped=[{DropNoSubscriber}]` | 不保留（无处可去） |
+
+- 三种死信原因 `DeadBacklogOverflow` / `DeadWaitTimeout` /
+  `DeadProcessTimeout` 彼此可区分，死信记录还带 `Attempts`、`Key`、
+  `DeadAt`，可解释每条消息为什么最终没成功。
+- 对外只暴露总线自己的结果类型（`*pubsub.Error` + `Kind`、
+  `PublishResult` + `DropReason`、`DeadLetter` + `DeadReason`）；
+  内部通道关闭等异常均被 recover/包装，不直接冒到调用方。
+- 慢/堆积的组不会拖住其他主题：序号分配与入队仍走“每主题锁”，组满时
+  立即失败入死信，不做无限等待（`TestExecGroupTopicIsolation` 断言无关
+  主题发布在微秒级返回）。
+
+### 3.5 死信队列：可查看、可重新投递
+
+- `g.DeadLetters()` 查看死信快照（不清空）。
+- `g.RequeueDead(ctx, seq)` 把死信按**原 Key** 投回：重置尝试次数，并插到
+  该 Key 队列**最前**——因此它先于同 Key 后续尚未处理的消息被派发，
+  重投仍满足“同 Key 有序、已完成不重复”。
+- 重投时若积压仍满，返回 `KindOverflow` 且**死信原样保留**（有界、不静默）。
+- 死信是“最终未能投递成功”消息的唯一去处；总线/组 Close 时死信随之释放。
+
+### 3.6 运行态可观测
+
+`g.Stats()` 返回 `GroupStats{OnlineExecutors, Retained, InFlight,
+DeadLetters, PerKey}`，便于测试与运维判定“有没有堵、堵在哪个 Key、
+有多少在途、多少进了死信”。
+
+---
+
+## 4. 消息编码与版本兼容
 
 两层编码：
 
@@ -123,7 +232,7 @@
 
 ---
 
-## 4. 关键并发设计（为什么正确）
+## 5. 关键并发设计（为什么正确）
 
 - **每订阅者单投递协程**：顺序由单协程 + 连续调度水位
   `scheduledSeq` 保证；候选严格为水位之后第一个“未确认且不在通道”的消息。
@@ -137,10 +246,19 @@
   消除了条件变量的丢信号窗口。
 - **同主题序号连续**：每主题发布锁让“序号分配 + 入队”原子，
   避免多发布者并发导致的暂时缺号被误判为已确认空洞。
+- **分担组竞争消费**：组内单派发协程是唯一向执行器通道发送的一方；
+  “选活 → 打租约 → 非阻塞入通道”在同一临界区完成，空槽由
+  `inflight < queueN` 预留，因此发送必立即成功、无需消费者配合，
+  也不会出现同一条被两个执行器同时拿走。
+- **同 Key 顺序与掉线转接解耦**：每个 Key 一条队列，只派发队头且队头
+  在途则整键等待；Leave 仅释放租约（消息留在队头），新执行者接手的
+  仍是同一个队头，换人不换序。等待超时由独立清扫协程负责，处理超时
+  由每条消息的看门狗负责，二者与派发协程之间只用组锁 + channel-Cond
+  同步，不互相等待、不存在卡死路径。
 
 ---
 
-## 5. 验证方法
+## 6. 验证方法
 
 ```bash
 # 全部单测
@@ -172,13 +290,20 @@ go test -run Example -v
 | `TestCodecVersionMismatch` / `TestCodecMissingField` / `TestCodecDecodeGarbage` | 版本/字段/编码异常分别映射为可区分 Kind |
 | `TestFrameMarshalRoundTrip`       | 二进制帧编解码往返、坏帧映射 `KindDecode` |
 | `TestReceiveDecodeErrors`         | 订阅侧解码拒绝并返回可区分错误 |
+| `TestExecCompetingConsumers`      | **多执行器分担**：3 执行器分担 60 条，每条同一时刻唯一属主、恰好完成一次，负载确实均摊 |
+| `TestExecFailoverOnLeave`         | **执行器上下线切换**：接手未 Ack 中途掉线，活转接在线者（attempt=2），掉线者同 ID 回来续做；不丢、不重已确认、主题不堵 |
+| `TestExecPerKeyOrderAcrossSwitch` | **同 Key 顺序**：3 个机器人键 × 8 条交错发布，中途执行器掉线 + 成员 2→1→3 变化，每个 Key 仍严格按序，不同 Key 并行 |
+| `TestExecConcurrentChurnAndOverflow` | **并发上下线 + 积压超限**：执行器持续 flapping，10 条保留消息每人恰好处理一次；满队后可靠 `KindOverflow`、低延迟 `DropQueueFull`，8 条死信持续可查 |
+| `TestExecDeadLetterRequeue`       | **死信查看与重投**：溢出死信可查看；积压满时重投被拒且死信保留；排空后重投先于同 Key 新消息、尝试次数重置、不重复 |
+| `TestExecTimeoutReasons`          | **超时语义区分**：无人接手 → `DeadWaitTimeout`；接手不 Ack 先转接，达到 `MaxAttempts` → `DeadProcessTimeout(attempts=2)`；与溢出三因可区分 |
+| `TestExecGroupTopicIsolation`     | **不连累其他主题**：堆满组快速失败入死信（µs 级），普通主题与另一组发布不受阻塞、不死锁 |
 
 单测通过 `t.Logf` 打印关键会话信息（收讫序号、重连续传序号、
 投递/丢弃计数、溢出背压结论与错误 Kind），便于复盘每次投递判定依据。
 
 ---
 
-## 6. 快速上手
+## 7. 快速上手
 
 ```go
 bus := pubsub.New(pubsub.BusConfig{DefaultQueueLen: 16}, nil)
@@ -202,3 +327,27 @@ _ = sub.Ack(msg.Seq)                // 确认，保证不重复投递
 | `DefaultQueueLen`          | 订阅者投递通道默认容量/在途窗口 |
 | `ReliableEnqueueTimeoutMs` | 可靠发布遇慢订阅者背压的有界等待上限 |
 | `RedeliveryTimeoutMs`      | 已投递未 Ack 消息的重发间隔（会话续传） |
+
+### 分担组配置项 `GroupConfig`
+
+| 字段                | 默认值 | 含义 |
+| ------------------- | ------ | ---- |
+| `MaxBacklog`        | 128    | 组内保留（排队 + 在途未 Ack）消息上限；超限发布立即失败/丢弃并进死信 |
+| `ExecutorQueueLen`  | 16     | 每个执行器的在途通道容量（同时在手消息上限） |
+| `ProcessTimeoutMs`  | 5000   | 接手后处理超时：先转接，达到 `MaxAttempts` 进死信 |
+| `WaitTimeoutMs`     | 30000  | 排队等待任意执行器接手的超时：进死信（与处理超时可区分） |
+| `MaxAttempts`       | 3      | 单条消息最多派发次数（含掉线转接） |
+
+### 多执行器分担最小示例
+
+```go
+g, _ := bus.CreateExecutorGroup(ctx, "robot/cmd", "line-A", pubsub.GroupConfig{})
+ex1, _ := g.Join(ctx, pubsub.ExecutorOption{})
+ex2, _ := g.Join(ctx, pubsub.ExecutorOption{}) // 两个执行器一起分担
+res, err := bus.PublishToGroup(ctx, "robot/cmd", "line-A",
+    pubsub.QoSReliable, cmd, &pubsub.ExecutorGroupKey{Key: "robot-7"})
+// 同 robot-7 的命令严格有序；ex1/ex2 之间竞争消费，一条只给一个
+// ex 掉线：ex1.Leave(ctx)；回来续做：g.Join(ctx, ExecutorOption{ResumeID: id})
+for _, dl := range g.DeadLetters() { /* 查看最终未成功的消息及原因 */ }
+_ = g.RequeueDead(ctx, dl.Msg.Seq) // 按原 Key 有序重投
+```

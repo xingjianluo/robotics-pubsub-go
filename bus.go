@@ -65,15 +65,17 @@ type Bus struct {
 	frame *frameCodec
 
 	mu         sync.RWMutex
-	topicLocks map[string]*sync.Mutex          // 每主题发布串行锁
-	topics     map[string]map[string]*subState // topic -> subID -> state
-	byID       map[string]*subState            // subID -> state（续传查找）
+	topicLocks map[string]*sync.Mutex            // 每主题发布串行锁
+	topics     map[string]map[string]*subState   // topic -> subID -> state
+	byID       map[string]*subState              // subID -> state（续传查找）
+	groups     map[string]map[string]*groupState // topic -> groupName -> state
 	schemas    map[string]Schema
 	seqMu      sync.Mutex
 	seqs       map[string]uint64 // topic -> 单调递增序号
 	closed     bool
 
-	idCounter uint64
+	idCounter     uint64
+	execIDCounter uint64
 }
 
 // New 创建总线。codec 为 nil 时使用默认 JSONCodec。
@@ -97,6 +99,7 @@ func New(cfg BusConfig, codec Codec) *Bus {
 		topics:     map[string]map[string]*subState{},
 		topicLocks: map[string]*sync.Mutex{},
 		byID:       map[string]*subState{},
+		groups:     map[string]map[string]*groupState{},
 		schemas:    map[string]Schema{},
 		seqs:       map[string]uint64{},
 	}

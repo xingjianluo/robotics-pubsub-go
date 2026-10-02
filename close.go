@@ -13,7 +13,35 @@ func (b *Bus) Close() error {
 	for _, st := range b.byID {
 		states = append(states, st)
 	}
+	var groupStates []*groupState
+	for _, byTopic := range b.groups {
+		for _, st := range byTopic {
+			groupStates = append(groupStates, st)
+		}
+	}
 	b.mu.Unlock()
+
+	// 分担组：标记关闭并关闭全部执行器通道（派发/清扫协程随后退出）。
+	for _, gs := range groupStates {
+		gs.mu.Lock()
+		if gs.closed {
+			gs.mu.Unlock()
+			continue
+		}
+		gs.closed = true
+		chs := make([]chan *Delivery, 0, len(gs.executors))
+		for _, ex := range gs.executors {
+			ex.closed = true
+			ex.online = false
+			chs = append(chs, ex.guard.get())
+		}
+		gs.onlineIDs = nil
+		gs.signalLocked()
+		gs.mu.Unlock()
+		for _, ch := range chs {
+			safeCloseCh(ch)
+		}
+	}
 
 	for _, st := range states {
 		st.mu.Lock()
