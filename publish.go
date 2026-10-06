@@ -176,13 +176,16 @@ func (b *Bus) dispatchPublish(ctx context.Context, topic, key string, ver Versio
 	// 执行器组投递：组是可靠语义载体，消息在组内只由一个成员接手。
 	for _, g := range gsnap {
 		if qos == QoSLowLatency {
-			// 低延迟发布绝不阻塞：组积压未满则入队，满则给出可区分丢弃。
+			// 低延迟发布绝不阻塞：组积压未满则入队，满则给出可区分丢弃；
+			// 被丢弃的消息同时记入组死信队列（DeadBacklogOverflow），
+			// 可查看、可重新投递，不静默消失。
 			g.mu.Lock()
 			if g.closed {
 				g.mu.Unlock()
 				continue
 			}
 			if len(g.pending) >= g.maxPending {
+				g.recordDroppedLocked(env, DeadBacklogOverflow)
 				g.mu.Unlock()
 				res.Dropped = append(res.Dropped, DropInfo{
 					SubscriptionID: "group:" + g.name, Reason: DropQueueFull,
@@ -196,7 +199,14 @@ func (b *Bus) dispatchPublish(ctx context.Context, topic, key string, ver Versio
 		}
 		// 可靠发布：组积压超限时做有界等待（受 ctx/配置超时约束），
 		// 只阻塞本主题本次发布，不影响其他主题的发布者。
+		// 等待超时返回 KindOverflow，同时把消息记入组死信队列
+		// （DeadBacklogOverflow），可查看、可重新投递，不静默丢失。
 		if err := b.waitGroupWindow(ctx, g); err != nil {
+			g.mu.Lock()
+			if !g.closed {
+				g.recordDroppedLocked(env, DeadBacklogOverflow)
+			}
+			g.mu.Unlock()
 			return nil, newError(KindOverflow, topic,
 				fmt.Sprintf("group %s backlog timeout at seq=%d", g.name, seq), err)
 		}
@@ -246,7 +256,7 @@ func (b *Bus) waitForWindow(ctx context.Context, st *subState) error {
 	tick := time.NewTicker(time.Millisecond)
 	defer tick.Stop()
 	for {
-		if st.inflightCount() < st.queueN {
+		if st.windowOpen() {
 			return nil
 		}
 		select {

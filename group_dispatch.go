@@ -3,6 +3,7 @@ package pubsub
 import (
 	"hash/fnv"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -36,11 +37,14 @@ func (b *Bus) groupLoop(g *groupState) {
 		}
 		// 2. 选出下一条可投递的队首消息。
 		ms, kq, gm, ok := b.pickDeliverableLocked(g)
+		var wg *sync.WaitGroup
 		if ok {
-			// 在锁内登记在途发送：Leave/Close 关闭通道前会等待其归零，
-			// 而它们标记离线也在同一把锁下，因此登记与离线标记串行，
+			// 在锁内登记在途发送（按当前代际的 WaitGroup）：Leave/Close
+			// 关闭通道前会等待对应代际归零，而它们标记离线/换代际也在
+			// 同一把锁下，因此登记与离线标记串行，
 			// 不存在“已离线仍新增发送”的窗口。
-			ms.sendWg.Add(1)
+			wg = ms.sendWg
+			wg.Add(1)
 		}
 		if !ok {
 			// 无可投递：等待信号或最近的超时点（避免忙轮询）。
@@ -89,14 +93,16 @@ func (b *Bus) groupLoop(g *groupState) {
 		}()
 
 		if sent {
-			ms.sendWg.Done()
+			wg.Done()
 			continue
 		}
 		// 发送未完成：不算一次有效投递，释放该键。属主仍在线则保留
 		// 属主（下轮重试），已离线则清空属主以便转派其他成员。
+		// 按“在途序号”核对：期间若有死信重投插到队首，这里仍能
+		// 正确解除本序号的在途标志，不会误清也不会漏清。
 		g.mu.Lock()
 		if !g.closed {
-			if cur := g.keys[gm.key]; cur == kq && len(kq.seqs) > 0 && kq.seqs[0] == seq {
+			if cur := g.keys[gm.key]; cur == kq && kq.inFlight && kq.inFlightSeq == seq {
 				kq.inFlight = false
 				if m := g.members[kq.owner]; m == nil || !m.online || m.closed {
 					kq.owner = ""
@@ -108,7 +114,7 @@ func (b *Bus) groupLoop(g *groupState) {
 			g.signalLocked()
 		}
 		g.mu.Unlock()
-		ms.sendWg.Done()
+		wg.Done()
 	}
 }
 
@@ -182,6 +188,7 @@ func (b *Bus) pickDeliverableLocked(g *groupState) (*memberState, *keyQueue, *gr
 			}
 			gm.attempts++
 			kq.inFlight = true
+			kq.inFlightSeq = head
 			return ms, kq, gm, true
 		}
 		if !restart {

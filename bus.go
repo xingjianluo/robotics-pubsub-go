@@ -61,6 +61,16 @@ type subState struct {
 	scheduledSeq uint64                // 已选中送入“当前通道”的连续最大序号（单调，与 Ack 无关）
 	minSeq       uint64                // 最小未 Ack 序号（确认水位）
 	redeliver    []uint64              // 已读未 Ack、超时请求重发的序号
+	// epoch 调度代际号：每次 resetForResume（续传重建通道）自增。
+	// 投递协程在选中消息时记下代际，发送结束后仅在代际未变时才
+	// 回滚 scheduledSeq/inCh——否则说明期间发生了续传重置，状态
+	// 已由 resetForResume 重排，旧发送的回滚会把水位退到未投递
+	// 消息之后，造成丢消息/乱序。
+	epoch uint64
+	// loopRunning 标记该订阅是否已有调度协程在跑：Pause 不会让
+	// 协程退出（它只是等待），续传（Resume/Subscribe-ResumeID）
+	// 绝不能再起第二个，否则多个发送协程锁外并发发送会乱序。
+	loopRunning bool
 
 	offline   bool
 	closed    bool
@@ -69,8 +79,11 @@ type subState struct {
 	// abortCh 用于解除投递协程在“当前通道”上的阻塞发送：
 	// resume/关闭时先关闭它让在途发送退出，再安全关闭旧通道。
 	abortCh chan struct{}
-	// sendWg 在途发送计数：关闭通道前等待其归零，消除 close/send 竞态。
-	sendWg sync.WaitGroup
+	// sendWg 在途发送计数，按“通道代际”区分：resetForResume 重建
+	// 通道时同时换一个新的 WaitGroup，关闭旧通道前只等待旧代际归零。
+	// 若全局共用一个，新代际的 Add 会与旧代际的 Wait 并发
+	// （WaitGroup 误用：Add 与 Wait 竞态/panic）。
+	sendWg *sync.WaitGroup
 }
 
 // Bus 进程内消息总线（回环模拟发布订阅链路）。

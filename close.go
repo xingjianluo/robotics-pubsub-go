@@ -1,5 +1,7 @@
 package pubsub
 
+import "sync"
+
 // Close 关闭总线：拒绝新发布/新订阅，唤醒并终止所有投递协程。
 // 重复调用返回幂等的 KindClosed 错误。
 func (b *Bus) Close() error {
@@ -28,6 +30,7 @@ func (b *Bus) Close() error {
 		ch := st.guard.get()
 		abort := st.abortCh
 		st.abortCh = nil
+		wg := st.sendWg
 		st.signalLocked()
 		st.signalLocked()
 		st.mu.Unlock()
@@ -35,7 +38,7 @@ func (b *Bus) Close() error {
 		if abort != nil {
 			close(abort)
 		}
-		st.sendWg.Wait()
+		wg.Wait()
 		safeCloseCh(ch)
 	}
 	// 关闭执行器组：调度协程退出，成员通道关闭，未确认状态随总线销毁。
@@ -43,17 +46,19 @@ func (b *Bus) Close() error {
 		g.mu.Lock()
 		g.closed = true
 		mss := make([]*memberState, 0, len(g.members))
+		wgs := make([]*sync.WaitGroup, 0, len(g.members))
 		for _, ms := range g.members {
 			ms.online = false
 			ms.closed = true
 			mss = append(mss, ms)
+			wgs = append(wgs, ms.sendWg)
 			safeCloseLeaveCh(ms.leaveCh)
 		}
 		g.signalLocked()
 		g.mu.Unlock()
-		for _, ms := range mss {
+		for i, ms := range mss {
 			// 等在途发送归零再关通道（避免 close/send 竞态）。
-			ms.sendWg.Wait()
+			wgs[i].Wait()
 			safeCloseCh(ms.guard.get())
 		}
 	}

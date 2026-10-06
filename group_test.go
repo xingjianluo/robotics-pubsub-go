@@ -323,6 +323,101 @@ func TestGroupBacklogOverflow(t *testing.T) {
 	t.Logf("low-latency publish to full group: dropped with reason %s", r.Dropped[0].Reason)
 }
 
+// TestGroupBacklogOverflowDeadLetter 积压超限/等待入队超时被拒收的消息
+// （可靠发布 KindOverflow、低延迟发布 DropQueueFull）必须统一落入组
+// 死信队列：可查看、原因可区分、可重新投递，且重投保序不重复。
+func TestGroupBacklogOverflowDeadLetter(t *testing.T) {
+	bus := New(BusConfig{DefaultQueueLen: 4, ReliableEnqueueTimeoutMs: 150,
+		GroupDeliveryTimeoutMs: 60000, GroupMaxAttempts: 100}, nil)
+	defer bus.Close()
+	ctx := context.Background()
+
+	// 成员在线但先不消费：积压只增不减。
+	m, err := bus.JoinGroup(ctx, "t/ovfl", "exec",
+		GroupOption{QueueLen: 4, MaxPending: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := bus.PublishRawKeyed(ctx, "t/ovfl", "robot-1", 1, QoSReliable, []byte{byte(i)}); err != nil {
+			t.Fatalf("publish %d within backlog limit: %v", i, err)
+		}
+	}
+	// 场景 1：可靠发布等待入组窗口超时 -> KindOverflow，且消息落死信。
+	_, err = bus.PublishRawKeyed(ctx, "t/ovfl", "robot-1", 1, QoSReliable, []byte{2})
+	if err == nil || !IsError(err, KindOverflow) {
+		t.Fatalf("expected KindOverflow on backlog overflow, got %v", err)
+	}
+	// 场景 2：低延迟发布遇满组 -> DropQueueFull，消息同样落死信。
+	r, err := bus.PublishRawKeyed(ctx, "t/ovfl", "robot-1", 1, QoSLowLatency, []byte{3})
+	if err != nil {
+		t.Fatalf("low-latency publish must not error: %v", err)
+	}
+	if len(r.Dropped) != 1 || r.Dropped[0].Reason != DropQueueFull {
+		t.Fatalf("expected DropQueueFull for full group, got %+v", r.Dropped)
+	}
+
+	// 判定 1：两条被拒收的消息都能在死信队列看到，原因与处理超时/尝试
+	// 超限可区分（DeadBacklogOverflow），序号与负载完整。
+	dead, err := bus.DeadLetters("t/ovfl", "exec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dead) != 2 {
+		t.Fatalf("expected 2 overflow dead letters, got %+v", dead)
+	}
+	for i, d := range dead {
+		wantSeq := uint64(3 + i)
+		if d.Seq != wantSeq || d.Reason != DeadBacklogOverflow {
+			t.Fatalf("dead letter %+v, want seq=%d reason=%s", d, wantSeq, DeadBacklogOverflow)
+		}
+		if len(d.Payload) != 1 || d.Payload[0] != byte(2+i) {
+			t.Fatalf("dead letter payload lost: %+v", d)
+		}
+	}
+	t.Logf("overflow conclusions kept (KindOverflow / DropQueueFull); "+
+		"both rejected messages landed in dlq: seq=%d,%d reason=%s",
+		dead[0].Seq, dead[1].Seq, dead[0].Reason)
+
+	// 排空：成员开始消费，先收齐组内积压的 seq=1,2。
+	recv := func(want uint64) {
+		t.Helper()
+		select {
+		case d := <-m.Messages():
+			if d.Msg.Seq != want {
+				t.Fatalf("delivered seq=%d, want %d (order violation)", d.Msg.Seq, want)
+			}
+			if err := m.Ack(d.Msg.Seq); err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting seq=%d", want)
+		}
+	}
+	recv(1)
+	recv(2)
+
+	// 判定 2：两条死信可按原序号重投回组，按序送达、attempts 重新计数。
+	if err := bus.RedeliverDeadLetter("t/ovfl", "exec", 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.RedeliverDeadLetter("t/ovfl", "exec", 3); err != nil {
+		t.Fatal(err)
+	}
+	recv(3) // 即使按 4、3 顺序请求重投，键内仍按序号升序送达
+	recv(4)
+	dead, _ = bus.DeadLetters("t/ovfl", "exec")
+	if len(dead) != 0 {
+		t.Fatalf("dead letter queue should be drained after redelivery, got %+v", dead)
+	}
+	select {
+	case d := <-m.Messages():
+		t.Fatalf("unexpected extra delivery: seq=%d", d.Msg.Seq)
+	case <-time.After(300 * time.Millisecond):
+	}
+	t.Logf("overflow dead letters redelivered in order (seq 3,4), dlq drained, no duplicates")
+}
+
 // TestGroupDeadLetterTimeoutAndRedeliver 迟迟不被处理的消息进入
 // 死信队列（原因可区分），可查看、可重新投递，且重投保持顺序不重复。
 func TestGroupDeadLetterTimeoutAndRedeliver(t *testing.T) {
@@ -413,6 +508,106 @@ drained:
 	}
 	t.Logf("redeliver ok: seq 1,2 redelivered in order with fresh attempts, dlq drained, no duplicates")
 }
+
+// TestGroupRedeliverWhileKeyBusy 回归：死信重投时，同一个 Key 还有
+// 正在处理（在途）或排队的消息——重投消息必须能真正送出、按原顺序
+// 插回队首、不重复、不被卡死（此前在途标志按“位置”清理，重投插到
+// 队首后标志永远清不掉，重投消息会被卡住直到再次超时被判死）。
+func TestGroupRedeliverWhileKeyBusy(t *testing.T) {
+	bus := New(BusConfig{DefaultQueueLen: 8, GroupMaxPending: 64,
+		GroupDeliveryTimeoutMs: 60000, GroupMaxAttempts: 1}, nil)
+	defer bus.Close()
+	ctx := context.Background()
+
+	m1, err := bus.JoinGroup(ctx, "t/redl", "exec", GroupOption{QueueLen: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := m1.ID()
+	recv := func(want uint64, timeout time.Duration) *Delivery {
+		t.Helper()
+		select {
+		case d := <-m1.Messages():
+			if d.Msg.Seq != want {
+				t.Fatalf("delivered seq=%d, want %d (order/no-dup violation)", d.Msg.Seq, want)
+			}
+			return d
+		case <-time.After(timeout):
+			t.Fatalf("timeout waiting seq=%d (redelivery stuck behind busy key)", want)
+			return nil
+		}
+	}
+
+	// 场景 1：构造死信。MaxAttempts=1，seq=2 投递后不确认就掉线，
+	// 重新入组时尝试次数已达上限 -> 判死（原因 DeadMaxAttempts）。
+	for i := 0; i < 3; i++ {
+		if _, err := bus.PublishRawKeyed(ctx, "t/redl", "robot-1", 1, QoSReliable, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := recv(1, 2*time.Second)
+	if err := m1.Ack(d.Msg.Seq); err != nil {
+		t.Fatal(err)
+	}
+	d = recv(2, 2*time.Second) // seq=2 留在手里不确认
+	if err := m1.Leave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("step1: seq=1 acked, seq=2 delivered(attempt=%d) then member left unacked", d.Attempt)
+	if _, err := bus.JoinGroup(ctx, "t/redl", "exec", GroupOption{MemberID: id, QueueLen: 8}); err != nil {
+		t.Fatal(err)
+	}
+	// 判定 1：seq=2 因尝试超限进入死信（seq=3 能被投递即证明 2 已出队判死）。
+	d = recv(3, 2*time.Second)
+	dead, err := bus.DeadLetters("t/redl", "exec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dead) != 1 || dead[0].Seq != 2 || dead[0].Reason != DeadMaxAttempts {
+		t.Fatalf("expected seq=2 dead with %s, got %+v", DeadMaxAttempts, dead)
+	}
+	t.Logf("step2: seq=2 dead-lettered (reason=%s), seq=3 now in flight (held unacked)", dead[0].Reason)
+
+	// 场景 2：同键有在途（seq=3）+ 排队（seq=4）消息时重投死信 seq=2。
+	if err := bus.RedeliverDeadLetter("t/redl", "exec", 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bus.PublishRawKeyed(ctx, "t/redl", "robot-1", 1, QoSReliable, []byte{9}); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("step3: redelivered dead seq=2 while seq=3 in-flight and seq=4 queued")
+
+	// 判定 2：确认在途的 seq=3 后，重投的 seq=2 必须真正送出（不被卡死），
+	// 且排在新消息 seq=4 之前（键内原顺序），attempts 重新计数。
+	if err := m1.Ack(3); err != nil {
+		t.Fatal(err)
+	}
+	d = recv(2, 2*time.Second)
+	if d.Attempt != 1 {
+		t.Fatalf("redelivered seq=2 attempt=%d, want fresh count 1", d.Attempt)
+	}
+	if err := m1.Ack(2); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("step4: redelivered seq=2 delivered after in-flight seq=3 acked, attempt reset to 1")
+	d = recv(4, 2*time.Second)
+	if err := m1.Ack(4); err != nil {
+		t.Fatal(err)
+	}
+
+	// 判定 3：全部确认后不再有重复投递，死信队列已清空。
+	select {
+	case dd := <-m1.Messages():
+		t.Fatalf("unexpected extra delivery: seq=%d", dd.Msg.Seq)
+	case <-time.After(300 * time.Millisecond):
+	}
+	dead, _ = bus.DeadLetters("t/redl", "exec")
+	if len(dead) != 0 {
+		t.Fatalf("dead letter queue should be drained, got %+v", dead)
+	}
+	t.Logf("redeliver-while-busy ok: seq 2 went out in key order, no stuck, no duplicates, dlq drained")
+}
+
 
 // TestGroupMaxAttempts 投递尝试超限的消息判死进死信队列，
 // 原因与超时判死可区分。

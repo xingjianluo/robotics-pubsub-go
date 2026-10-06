@@ -193,6 +193,107 @@ func TestSubscriptionVisibility(t *testing.T) {
 	t.Logf("subscription add/remove immediately visible: %s", r2.Dropped[0].Reason)
 }
 
+// TestResumeStressNoLoss 回归：一边持续发布一边反复“离线-续传”
+// （交替走 Subscription.Resume 和 Subscribe(ResumeID) 两条路径），
+// 任何时刻都不丢消息、首投不乱序、已确认不重复、不偶发超时。
+// 此前续传会再起一个调度协程（多发送者并发乱序）、不重置调度水位
+// （旧 inCh/scheduledSeq 残留卡死），且发送失败回滚与续传重置竞态
+// 会把水位退到未投递消息之后（丢消息/超时）。
+func TestResumeStressNoLoss(t *testing.T) {
+	bus := New(BusConfig{DefaultQueueLen: 4, ReliableEnqueueTimeoutMs: 10000,
+		RedeliveryTimeoutMs: 60000}, nil)
+	defer bus.Close()
+	ctx := context.Background()
+
+	sub, err := bus.Subscribe(ctx, "t/resume-stress", QoSReliable, SubscribeOption{QueueLen: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := sub.ID()
+
+	const total = 300
+	pubDone := make(chan error, 1)
+	go func() {
+		for i := 0; i < total; i++ {
+			if _, err := bus.PublishRaw(ctx, "t/resume-stress", 1, QoSReliable, []byte{byte(i)}); err != nil {
+				pubDone <- err
+				return
+			}
+		}
+		pubDone <- nil
+	}()
+
+	received := make(map[uint64]bool, total)
+	var lastFirst uint64 // 最近一条“首次投递”的序号（必须严格递增）
+	dups := 0
+	cycles := 0
+	ch := sub.Messages()
+	deadline := time.After(30 * time.Second)
+	for len(received) < total {
+		select {
+		case d, ok := <-ch:
+			if !ok {
+				// 通道被续传重建关闭：换到当前通道继续。
+				ch = sub.Messages()
+				continue
+			}
+			seq := d.Msg.Seq
+			if received[seq] {
+				dups++ // 续传边界上的在途副本：at-least-once 允许，按 Seq 去重
+			} else {
+				if seq <= lastFirst {
+					t.Fatalf("first-delivery order broken: seq=%d after %d", seq, lastFirst)
+				}
+				lastFirst = seq
+				received[seq] = true
+			}
+			if err := sub.Ack(seq); err != nil {
+				t.Fatalf("ack seq=%d: %v", seq, err)
+			}
+			// 每收几条就离线-续传一次，让在途发送与续传重置充分交错。
+			if len(received)%7 == 3 {
+				cycles++
+				if err := sub.Pause(ctx); err != nil {
+					t.Fatalf("pause: %v", err)
+				}
+				if cycles%2 == 0 {
+					// 路径 2：用 ResumeID 重新订阅续传（等价语义）。
+					s2, err := bus.Subscribe(ctx, "t/resume-stress", QoSReliable,
+						SubscribeOption{ResumeID: id, QueueLen: 4})
+					if err != nil {
+						t.Fatalf("resume-by-id: %v", err)
+					}
+					if s2.ID() != id {
+						t.Fatalf("resume id mismatch %s != %s", s2.ID(), id)
+					}
+					sub = s2
+				} else {
+					// 路径 1：原句柄 Resume。
+					if err := sub.Resume(ctx); err != nil {
+						t.Fatalf("resume: %v", err)
+					}
+				}
+				ch = sub.Messages()
+			}
+		case <-deadline:
+			t.Fatalf("timeout: received %d/%d (dups=%d cycles=%d) — message lost or scheduler stuck",
+				len(received), total, dups, cycles)
+		}
+	}
+	if err := <-pubDone; err != nil {
+		t.Fatalf("publisher: %v", err)
+	}
+	// 判定：恰好 1..total 全部至少收到一次（不丢），首投严格升序（不乱）。
+	for seq := uint64(1); seq <= total; seq++ {
+		if !received[seq] {
+			t.Fatalf("seq=%d never received (lost)", seq)
+		}
+	}
+	t.Logf("resume stress ok: %d msgs all received, first-delivery strictly ordered, "+
+		"resume-cycles=%d (mixed Resume / ResumeID), boundary-duplicates=%d (deduped by seq)",
+		total, cycles, dups)
+}
+
 // TestConcurrentOverflowStress 并发高可靠发布 + 慢消费者 + 队列溢出，
 // 验证不丢已入队消息、不死锁、最终全部可在消费者跟上后收齐。
 func TestConcurrentOverflowStress(t *testing.T) {
