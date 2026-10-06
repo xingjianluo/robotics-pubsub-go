@@ -16,6 +16,10 @@ import (
 //
 // QoSLowLatency：绝不阻塞；队列满则丢弃并在结果中给出 DropQueueFull，
 // 无在线订阅者给出 DropNoSubscriber。
+//
+// 执行器组入组失败（积压超限丢弃 / 等待积压窗口超时）的消息会落入该组
+// 死信队列（原因分别为 DeadBacklogFull / DeadEnqueueTimeout），可通过
+// DeadLetters 查看、RedeliverDeadLetter 重新投递，不静默丢失。
 func (b *Bus) Publish(ctx context.Context, topic string, qos QoS, payload any) (*PublishResult, error) {
 	return b.PublishKeyed(ctx, topic, "", qos, payload)
 }
@@ -176,13 +180,15 @@ func (b *Bus) dispatchPublish(ctx context.Context, topic, key string, ver Versio
 	// 执行器组投递：组是可靠语义载体，消息在组内只由一个成员接手。
 	for _, g := range gsnap {
 		if qos == QoSLowLatency {
-			// 低延迟发布绝不阻塞：组积压未满则入队，满则给出可区分丢弃。
+			// 低延迟发布绝不阻塞：组积压未满则入队；满则给出可区分丢弃，
+			// 同时把消息落进死信队列（可查看、可重新投递，不静默丢失）。
 			g.mu.Lock()
 			if g.closed {
 				g.mu.Unlock()
 				continue
 			}
 			if len(g.pending) >= g.maxPending {
+				g.appendDeadLocked(env, DeadBacklogFull, 0)
 				g.mu.Unlock()
 				res.Dropped = append(res.Dropped, DropInfo{
 					SubscriptionID: "group:" + g.name, Reason: DropQueueFull,
@@ -195,8 +201,14 @@ func (b *Bus) dispatchPublish(ctx context.Context, topic, key string, ver Versio
 			continue
 		}
 		// 可靠发布：组积压超限时做有界等待（受 ctx/配置超时约束），
-		// 只阻塞本主题本次发布，不影响其他主题的发布者。
+		// 只阻塞本主题本次发布，不影响其他主题的发布者。等待超时仍未
+		// 入组的消息落死信队列（可查看、可重新投递），不静默丢失。
 		if err := b.waitGroupWindow(ctx, g); err != nil {
+			g.mu.Lock()
+			if !g.closed {
+				g.appendDeadLocked(env, DeadEnqueueTimeout, 0)
+			}
+			g.mu.Unlock()
 			return nil, newError(KindOverflow, topic,
 				fmt.Sprintf("group %s backlog timeout at seq=%d", g.name, seq), err)
 		}

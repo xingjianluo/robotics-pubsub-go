@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 )
 
@@ -86,6 +87,7 @@ func (b *Bus) newSubStateLocked(topic string, qos QoS, queueN int) *subState {
 		guard:     &chGuard{ch: ch},
 		waitCh:    make(chan struct{}),
 		abortCh:   make(chan struct{}),
+		sendWg:    new(sync.WaitGroup),
 		pending:   map[uint64]*queuedMsg{},
 		redelivMs: b.cfg.RedeliveryTimeoutMs,
 	}
@@ -106,13 +108,16 @@ func (b *Bus) removeSubscription(s *Subscription) error {
 	ch := st.guard.get()
 	abort := st.abortCh
 	st.abortCh = nil
+	// closed 置位后 selectLocked 只会退出、不再登记新发送，
+	// 因此摘取当前代计数等待归零是安全的（无并发 Add）。
+	wg := st.sendWg
 	st.signalLocked()
 	st.mu.Unlock()
 	// 先让在途阻塞发送退出并归零，再关闭通道（消除 close/send 竞态）。
 	if abort != nil {
 		close(abort)
 	}
-	st.sendWg.Wait()
+	wg.Wait()
 	safeCloseCh(ch)
 
 	b.mu.Lock()
@@ -145,9 +150,9 @@ func (b *Bus) setOffline(s *Subscription, offline bool) error {
 	if !offline {
 		// resume：重建投递通道，未 Ack 消息全部重置为待投递；
 		// resetForResume 已关闭旧 abortCh 解除在途阻塞发送，
-		// 等其归零后再关闭旧通道（消除 close/send 竞态）。
-		old := st.resetForResume()
-		st.sendWg.Wait()
+		// 等旧代发送归零后再关闭旧通道（消除 close/send 竞态）。
+		old, oldWg := st.resetForResume()
+		oldWg.Wait()
 		safeCloseCh(old)
 	}
 	return nil

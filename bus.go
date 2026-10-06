@@ -69,8 +69,10 @@ type subState struct {
 	// abortCh 用于解除投递协程在“当前通道”上的阻塞发送：
 	// resume/关闭时先关闭它让在途发送退出，再安全关闭旧通道。
 	abortCh chan struct{}
-	// sendWg 在途发送计数：关闭通道前等待其归零，消除 close/send 竞态。
-	sendWg sync.WaitGroup
+	// sendWg 当前通道代际的在途发送计数：关闭该代通道前等待其归零
+	// （消除 close/send 竞态）。每次重建通道（resume）时整体换新，
+	// 因此等待旧代归零不会与新一代的 Add 并发（WaitGroup 复用违例）。
+	sendWg *sync.WaitGroup
 }
 
 // Bus 进程内消息总线（回环模拟发布订阅链路）。

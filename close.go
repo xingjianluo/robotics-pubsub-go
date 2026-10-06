@@ -28,6 +28,7 @@ func (b *Bus) Close() error {
 		ch := st.guard.get()
 		abort := st.abortCh
 		st.abortCh = nil
+		wg := st.sendWg
 		st.signalLocked()
 		st.signalLocked()
 		st.mu.Unlock()
@@ -35,7 +36,7 @@ func (b *Bus) Close() error {
 		if abort != nil {
 			close(abort)
 		}
-		st.sendWg.Wait()
+		wg.Wait()
 		safeCloseCh(ch)
 	}
 	// 关闭执行器组：调度协程退出，成员通道关闭，未确认状态随总线销毁。

@@ -99,12 +99,15 @@ func (st *subState) advanceLocked() {
 }
 
 // resetForResume 重建通道，所有未 Ack 消息重置为未投递，scheduledSeq 归零。
-// 返回旧通道（由调用方关闭），投递协程会在新通道从最小序号重发。
-func (st *subState) resetForResume() chan *Delivery {
+// 返回旧通道与旧代发送计数（由调用方等待归零后关闭旧通道），
+// 投递协程会在新通道从最小序号重发。
+func (st *subState) resetForResume() (chan *Delivery, *sync.WaitGroup) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	newCh := make(chan *Delivery, st.queueN)
 	old := st.guard.replace(newCh)
+	oldWg := st.sendWg
+	st.sendWg = new(sync.WaitGroup)
 	// 更换中止点：旧 abortCh 关闭以解除旧通道上的在途阻塞发送。
 	if st.abortCh != nil {
 		close(st.abortCh)
@@ -126,7 +129,7 @@ func (st *subState) resetForResume() chan *Delivery {
 	}
 	st.offline = false
 	st.signalLocked()
-	return old
+	return old, oldWg
 }
 
 func (st *subState) smallestPendingLocked() uint64 {
@@ -239,11 +242,12 @@ func (b *Bus) dispatchLoop(st *subState) {
 		// 锁内决策：取出下一条；无消息可发时按协议在锁内等待。
 		st.mu.Lock()
 		nextSeq, ch, d, red, redeliv, exitSel := b.selectLocked(st)
+		// 锁内登记在途发送（按当前通道代际的计数）：resume/close 会
+		// 等待“它替换/摘取的那一代”计数归零再关旧通道，而换代与
+		// 置 closed 都在同一把锁下，不存在“已关闭仍新增发送”的窗口。
+		wg := st.sendWg
 		if !exitSel {
-			// 锁内登记在途发送：resume/close 关通道前会等待其归零，
-			// 而它们换 abortCh/置 closed 也在同一把锁下，不存在
-			// “已关闭仍新增发送”的窗口。
-			st.sendWg.Add(1)
+			wg.Add(1)
 		}
 		abort := st.abortCh
 		st.mu.Unlock()
@@ -276,7 +280,7 @@ func (b *Bus) dispatchLoop(st *subState) {
 			}
 		}()
 
-		st.sendWg.Done()
+		wg.Done()
 		exitNow := false
 		st.mu.Lock()
 		if redeliv && sent {
@@ -288,7 +292,11 @@ func (b *Bus) dispatchLoop(st *subState) {
 			if q, ok := st.pending[nextSeq]; ok {
 				q.inCh = false
 			}
-			if !red {
+			// 回退调度水位让本条重发；但 resume 可能已把水位回退到
+			// 更小未确认序号之前（minSeq-1），此时绝不能再向前拨，
+			// 否则 [minSeq, nextSeq-1] 内未确认的消息会被永久跳过
+			// （少收/跳号/卡死）。只有水位仍在本条时才回退。
+			if !red && st.scheduledSeq >= nextSeq {
 				st.scheduledSeq = nextSeq - 1
 			}
 		}

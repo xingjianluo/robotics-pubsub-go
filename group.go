@@ -31,9 +31,11 @@ type GroupOption struct {
 type DeadReason int
 
 const (
-	DeadNone        DeadReason = iota
-	DeadTimeout                // 等待处理超时仍未被确认
-	DeadMaxAttempts            // 投递尝试次数超过上限
+	DeadNone           DeadReason = iota
+	DeadTimeout                   // 等待处理超时仍未被确认
+	DeadMaxAttempts               // 投递尝试次数超过上限
+	DeadBacklogFull               // 低延迟发布时组积压超限，消息未能入组
+	DeadEnqueueTimeout            // 可靠发布等待积压窗口超时，消息未能入组
 )
 
 func (r DeadReason) String() string {
@@ -42,6 +44,10 @@ func (r DeadReason) String() string {
 		return "delivery-timeout"
 	case DeadMaxAttempts:
 		return "max-attempts-exceeded"
+	case DeadBacklogFull:
+		return "backlog-full"
+	case DeadEnqueueTimeout:
+		return "enqueue-timeout"
 	default:
 		return "not-dead"
 	}
@@ -78,9 +84,12 @@ type GroupMember struct {
 // 只有队首允许在途（head-of-line），保证同键消息严格按序、
 // 且任一时刻同一条消息只被一个成员接手。
 type keyQueue struct {
-	seqs     []uint64 // 未确认序号，升序
-	owner    string   // 当前负责成员 ID（"" 表示待分配）
-	inFlight bool     // 队首已投递未确认
+	seqs  []uint64 // 未确认序号，升序
+	owner string   // 当前负责成员 ID（"" 表示待分配）
+	// inFlight 在途（已投递未确认）消息的序号，0 表示无在途。
+	// 必须按序号记录而非布尔：重投的旧消息可能插到在途消息之前，
+	// 布尔标志会错配到新队首，导致确认在途消息后新队首被永久卡住。
+	inFlight uint64
 }
 
 // groupMsg 组级未确认消息。
@@ -98,8 +107,11 @@ type memberState struct {
 	closed  bool
 	queueN  int
 	guard   *chGuard
-	leaveCh chan struct{}  // 离线/关闭时关闭，用于解除调度器阻塞发送
-	sendWg  sync.WaitGroup // 在途发送计数：关闭通道前等待其归零（避免 close/send 竞态）
+	leaveCh chan struct{} // 离线/关闭时关闭，用于解除调度器阻塞发送
+	// sendWg 当前通道代际的在途发送计数：关闭该代通道前等待其归零
+	// （避免 close/send 竞态）。每次重建通道（Leave/重新入组）时整体
+	// 换新，等待旧代归零不会与新一代的 Add 并发（WaitGroup 复用违例）。
+	sendWg *sync.WaitGroup
 }
 
 // groupState 执行器组运行态。
@@ -154,7 +166,7 @@ func (g *groupState) inflight() int {
 }
 
 // removeLocked 从 pending 与其键队列中移除序号（调用方持锁）。
-// 移除队首时解除 inFlight，后续消息可继续投递；已删除键队列被回收。
+// 移除在途消息时解除 inFlight，后续消息可继续投递；已删除键队列被回收。
 func (g *groupState) removeLocked(seq uint64) *groupMsg {
 	gm, ok := g.pending[seq]
 	if !ok {
@@ -165,11 +177,11 @@ func (g *groupState) removeLocked(seq uint64) *groupMsg {
 		for i, s := range kq.seqs {
 			if s == seq {
 				kq.seqs = append(kq.seqs[:i], kq.seqs[i+1:]...)
-				if i == 0 {
-					kq.inFlight = false
-				}
 				break
 			}
+		}
+		if kq.inFlight == seq {
+			kq.inFlight = 0
 		}
 		if len(kq.seqs) == 0 {
 			delete(g.keys, gm.key)
@@ -185,20 +197,27 @@ func (g *groupState) toDeadLocked(seq uint64, reason DeadReason) {
 		return
 	}
 	g.removeLocked(seq)
+	g.appendDeadLocked(gm.env, reason, gm.attempts)
+	g.signalLocked()
+}
+
+// appendDeadLocked 追加一条死信记录（调用方持锁）。
+// 组内判死与发布侧入组失败（积压超限/等待超时）共用同一落点，
+// 保证“最终没投成功的消息”都能查看、都能重新投递。
+func (g *groupState) appendDeadLocked(env *Envelope, reason DeadReason, attempts int) {
 	g.dlq = append(g.dlq, DeadLetter{
 		Topic:    g.topic,
 		Group:    g.name,
-		ID:       gm.env.ID,
-		Seq:      seq,
-		Key:      gm.key,
-		Version:  gm.env.Version,
-		Payload:  gm.env.Body,
+		ID:       env.ID,
+		Seq:      env.Seq,
+		Key:      env.Key,
+		Version:  env.Version,
+		Payload:  env.Body,
 		Reason:   reason,
-		Attempts: gm.attempts,
+		Attempts: attempts,
 		FailedAt: time.Now(),
 	})
-	g.dlqSet[seq] = true
-	g.signalLocked()
+	g.dlqSet[env.Seq] = true
 }
 
 // JoinGroup 加入（或创建）主题上的执行器组。
@@ -248,14 +267,18 @@ func (b *Bus) JoinGroup(_ context.Context, topic, group string, opt GroupOption)
 			return nil, newError(KindInvalidArgument, topic,
 				"cannot rejoin: member not found or closed: "+opt.MemberID, nil)
 		}
-		// 重新上线：重建投递通道与离线解除点，旧通道上滞留的副本随通道关闭。
-		ms.online = true
-		ms.queueN = queueN
+		// 重新上线：先在同一把锁下重建投递通道、发送计数代际与
+		// 离线解除点，全部就绪后再标记在线（调度器不会看到中间态）；
+		// 旧通道上滞留的副本随通道关闭。
 		old := ms.guard.replace(make(chan *Delivery, queueN))
+		oldWg := ms.sendWg
+		ms.sendWg = new(sync.WaitGroup)
 		ms.leaveCh = make(chan struct{})
+		ms.queueN = queueN
+		ms.online = true
 		gs.signalLocked()
 		gs.mu.Unlock()
-		ms.sendWg.Wait()
+		oldWg.Wait()
 		safeCloseCh(old)
 	} else {
 		n := atomic.AddUint64(&b.idCounter, 1)
@@ -264,6 +287,7 @@ func (b *Bus) JoinGroup(_ context.Context, topic, group string, opt GroupOption)
 			queueN:  queueN,
 			guard:   &chGuard{ch: make(chan *Delivery, queueN)},
 			leaveCh: make(chan struct{}),
+			sendWg:  new(sync.WaitGroup),
 		}
 		ms.online = true
 		gs.members[ms.id] = ms
@@ -365,21 +389,24 @@ func (m *GroupMember) Leave(_ context.Context) error {
 	}
 	ms.online = false
 	safeCloseLeaveCh(ms.leaveCh) // 解除调度器对本成员通道的阻塞发送
-	// 重建投递通道：旧通道中滞留的未确认副本随通道关闭作废，
-	// 它们会被调度器转派给在线成员（at-least-once，消费方按 Seq 去重）。
+	// 重建投递通道与发送计数代际：旧通道中滞留的未确认副本随通道
+	// 关闭作废，它们会被调度器转派给在线成员（at-least-once，
+	// 消费方按 Seq 去重）。
 	old := ms.guard.replace(make(chan *Delivery, ms.queueN))
+	oldWg := ms.sendWg
+	ms.sendWg = new(sync.WaitGroup)
 	// 释放本成员名下的键：未确认工作可转给在线成员。
 	for _, kq := range g.keys {
 		if kq.owner == m.id {
 			kq.owner = ""
-			kq.inFlight = false
+			kq.inFlight = 0
 		}
 	}
 	g.signalLocked()
 	g.mu.Unlock()
-	// leaveCh 已关闭，在途发送会立即解除；等其归零后再关旧通道，
-	// 保证没有发送协程还在使用该通道。
-	ms.sendWg.Wait()
+	// leaveCh 已关闭，在途发送会立即解除；等旧代发送归零后再关
+	// 旧通道，保证没有发送协程还在使用该通道。
+	oldWg.Wait()
 	safeCloseCh(old)
 	return nil
 }
@@ -400,13 +427,16 @@ func (m *GroupMember) Close() error {
 	for _, kq := range g.keys {
 		if kq.owner == m.id {
 			kq.owner = ""
-			kq.inFlight = false
+			kq.inFlight = 0
 		}
 	}
 	ch := ms.guard.get()
+	// closed 置位并从 members 摘除后，调度器不会再对本成员登记
+	// 新发送，摘取当前代计数等待归零是安全的（无并发 Add）。
+	wg := ms.sendWg
 	g.signalLocked()
 	g.mu.Unlock()
-	ms.sendWg.Wait()
+	wg.Wait()
 	safeCloseCh(ch)
 	return nil
 }
@@ -464,8 +494,13 @@ func (b *Bus) RedeliverDeadLetter(topic, group string, seq uint64) error {
 		kq = &keyQueue{}
 		g.keys[dl.Key] = kq
 	}
-	// 升序插入：重新投递的旧消息排在其键内更新消息之前。
+	// 升序插入：重新投递的旧消息排在其键内更新消息之前；
+	// 但不得插到在途消息（必为队首）之前——在途消息已在成员手中，
+	// 越过它会破坏“任一时刻同键仅一条在途”的队首语义。
 	pos := sort.Search(len(kq.seqs), func(i int) bool { return kq.seqs[i] > seq })
+	if kq.inFlight != 0 && pos == 0 {
+		pos = 1
+	}
 	kq.seqs = append(kq.seqs, 0)
 	copy(kq.seqs[pos+1:], kq.seqs[pos:])
 	kq.seqs[pos] = seq

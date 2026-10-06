@@ -122,15 +122,32 @@ _ = worker.Ack(d.Msg.Seq)  // 确认后绝不再派
 - **成员变更下的顺序**：顺序键按哈希绑定在线成员，成员变化只迁移
   “待重新分配”的键；无论换没换执行器，同键消息始终按主题序号升序到达。
 
+### 顺序与续传分别保证到什么程度
+
+- **同键顺序（首投）**：同一 Key 的消息严格按主题序号升序**首次**
+  投递；高序号不会越过尚未投递的低序号（键内队首语义）。
+- **至少一次（允许副本）**：掉线转派、超时重发、死信重投都会产生
+  同一序号的重复投递，投递记录携带 `Attempt`，消费方按 `Seq` 去重；
+  已确认（Ack 生效时仍在未确认集合中）的消息**绝不**再派。
+- **续传（成员重新入组 / 订阅 Resume）**：未确认工作完整保留，
+  从最小未确认序号起按序继续，不丢、不乱序；已确认不重复。
+  该路径有专门的压测回归（边压测边高频离线/续传），
+  保证任何时候都不丢消息、不跳号、不偶发超时。
+- **死信重投**：重投的旧消息排在其键内**尚未投递过**的消息之前，
+  但不越过正在处理的在途消息；重投后参与正常调度，
+  不会被同键在途/排队消息卡住或再次误判超时。
+
 ### 容量上限与失败语义（彼此可区分）
 
-| 场景 | 对外结论 |
-| ---- | -------- |
-| 可靠发布时组积压达到 `MaxPending` | 有界等待后返回 `KindOverflow`，已入队消息保留 |
-| 低延迟发布时组积压满 | 不阻塞，`PublishResult.Dropped` 给出 `DropQueueFull` |
-| 消息入组超过 `DeliveryTimeoutMs` 未确认 | 判死进死信队列，原因 `DeadTimeout` |
-| 投递尝试超过 `MaxAttempts` | 判死进死信队列，原因 `DeadMaxAttempts` |
+| 场景 | 对外结论 | 消息落点 |
+| ---- | -------- | -------- |
+| 可靠发布时组积压达到 `MaxPending` | 有界等待后返回 `KindOverflow`，已入队消息保留 | 未入组的消息进死信队列（`DeadEnqueueTimeout`） |
+| 低延迟发布时组积压满 | 不阻塞，`PublishResult.Dropped` 给出 `DropQueueFull` | 未入组的消息进死信队列（`DeadBacklogFull`） |
+| 消息入组超过 `DeliveryTimeoutMs` 未确认 | 判死 | 死信队列（`DeadTimeout`） |
+| 投递尝试超过 `MaxAttempts` | 判死 | 死信队列（`DeadMaxAttempts`） |
 
+- **任何最终没投成功的消息都不会凭空消失**：四种失败统一落组级
+  死信队列，可查看、可重新投递（见下节）。
 - 背压等待只阻塞本主题本次发布，**不拖住其他主题的发布者**；
   调度器对单个成员通道的发送有上限（成员离线立即解除），
   慢成员不会把全组永久卡死。
@@ -144,9 +161,14 @@ dead, _ := bus.DeadLetters("robot/cmd", "executors") // 查看
 _ = bus.RedeliverDeadLetter("robot/cmd", "executors", dead[0].Seq) // 重新投递
 ```
 
-- 最终未能投递成功的消息进入组级死信队列，携带 `Reason`/`Attempts`。
-- 重新投递以**原序号**插回其键队列的升序位置（顺序保持），
-  `Attempt` 重新计数；已确认/未判死的消息不会被重复注入。
+- 最终未能投递成功的消息（含上表四种原因）进入组级死信队列，
+  携带 `Reason`/`Attempts`，原因彼此可区分。
+- 重新投递以**原序号**插回其键队列：排在该键**尚未投递过**的消息
+  之前（顺序保持），但不会越过正在处理的在途消息（不破坏
+  “同键任一时刻仅一条在途”）；`Attempt` 重新计数。
+- 重投的消息真正参与调度：不会被在途/排队的同键消息卡住，
+  也不会被再次误判超时；已确认/未判死的消息不会被重复注入
+  （死信序号与未确认集合互斥，重复重投返回 `KindInvalidArgument`）。
 
 ---
 
@@ -195,7 +217,12 @@ _ = bus.RedeliverDeadLetter("robot/cmd", "executors", dead[0].Seq) // 重新投�
   消除了条件变量的丢信号窗口。
 - **关通道不与发送竞态**：投递协程在锁内登记在途发送（`sendWg`），
   resume/关闭先通过 `abortCh`/`leaveCh` 解除在途阻塞发送、等其归零，
-  再关闭旧通道，消除 close/send data race。
+  再关闭旧通道，消除 close/send data race。`sendWg` 按**通道代际**
+  整体换新：等待旧代归零不会与新一代的 `Add` 并发
+  （避免 WaitGroup 复用违例）。
+- **组内在途按序号跟踪**：键队列的 `inFlight` 记录在途消息的**序号**
+  而非布尔——重投的旧消息可能插到在途消息之后紧邻的位置，
+  布尔标志会错配队首导致确认后在途标记无法解除（队首被永久卡住）。
 - **同主题序号连续**：每主题发布锁让“序号分配 + 入队”原子，
   避免多发布者并发导致的暂时缺号被误判为已确认空洞。
 - **组调度单协程 + 键内队首**：每执行器组一个调度协程，锁内决策、
@@ -213,6 +240,12 @@ go test ./...
 # 竞态检测（核心场景要求零 data race）
 go test -race ./...
 
+# 反复重跑（续传/重投/搅动类场景要求可稳定重复）
+go test -race -count=20 -run 'TestResumeUnderLoadNoLoss|TestGroupRedeliver' .
+
+# 场景用例日志（覆盖哪些场景、每步判定依据）
+go test -v -run 'TestGroup' .
+
 # 压力复现（并发/重连/溢出场景反复运行）
 go test -race -count=40 ./...
 go test -count=100 ./...
@@ -225,10 +258,11 @@ go test -run Example -v
 
 | 测试                          | 场景与判定依据 |
 | ----------------------------- | -------------- |
-| `TestConcurrentPublishOrder`  | 8 发布者 × 60 条并发；严格升序、无重复、无 data race，打印会话统计 |
-| `TestReconnectNoLossNoDuplicate` | 离线期间发布 100 条，重连后恰好收到 51..150，已 Ack 的 1..50 不重投 |
+| `TestReconnectNoLossNoDuplicate` | 离线期间发布的消息重连后全部续传，已 Ack 不重复 |
 | `TestResumeByID`              | 用订阅者 ID 在新句柄上续传 |
 | `TestSubscriptionVisibility`  | 退订后发布立即得到 `DropNoSubscriber` |
+| `TestResumeUnderLoadNoLoss`  | **边压测边高频 Pause/Resume**（60 次搅动 × 400 条）：不丢、首投严格升序、不偶发超时（续传回归） |
+| `TestConcurrentPublishOrder`  | 8 发布者并发：严格升序、无重复、无 data race |
 | `TestConcurrentOverflowStress`| 慢消费者 + 队列溢出；发布方按 `KindOverflow` 重试，最终不丢不重不死锁 |
 | `TestReliableOverflowAndIsolation` | 背压超时返回 `KindOverflow`，且无关主题发布不被阻塞 |
 | `TestLowLatencyDropsWithReason`   | 溢出丢弃计入 `DropQueueFull`，账目守恒，发布不阻塞 |
@@ -236,12 +270,15 @@ go test -run Example -v
 | `TestCodecVersionMismatch` / `TestCodecMissingField` / `TestCodecDecodeGarbage` | 版本/字段/编码异常分别映射为可区分 Kind |
 | `TestFrameMarshalRoundTrip`       | 二进制帧编解码往返、坏帧映射 `KindDecode` |
 | `TestReceiveDecodeErrors`         | 订阅侧解码拒绝并返回可区分错误 |
-| `TestGroupSharedConsumption`      | 3 执行器分担 60 条：每条恰好一个成员接手一次、同键严格升序、负载确实分摊 |
+| `TestGroupSharedConsumption`      | 3 执行器分担 60 条：每条恰好一个成员接手一次、同键严格升序 |
 | `TestGroupMemberFailover`         | 成员持未确认消息掉线：已确认不重投，未确认转派在线成员且键内顺序不乱 |
 | `TestGroupRejoinResume`           | 全员离线时发布照常积压；原成员凭 ID 回来按序续传、已确认不重复 |
-| `TestGroupBacklogOverflow`        | 组积压超限返回 `KindOverflow`；低延迟发布给 `DropQueueFull`；其他主题不受拖累 |
-| `TestGroupDeadLetterTimeoutAndRedeliver` | 超时未确认进死信（`DeadTimeout`）；重投保序、计数重置、判错可区分 |
+| `TestGroupBacklogOverflow`        | 组积压超限：可靠发布 `KindOverflow`、低延迟 `DropQueueFull`，不拖累其他主题 |
+| `TestGroupOverflowLandsInDeadLetter` | 积压超限丢弃（`DeadBacklogFull`）与等待入组超时（`DeadEnqueueTimeout`）统一落死信：可查看、原因可区分、重投保序不重复 |
+| `TestGroupDeadLetterTimeoutAndRedeliver` | 超时未确认进死信（`DeadTimeout`）；重投按序回组、计数重置、队列清空 |
+| `TestGroupRedeliverBehindInflight` | **重投与同键在途/排队共存**：重投消息不被在途标志卡住、不再次误判超时，排在新消息之前、已确认不重发（回归） |
 | `TestGroupMaxAttempts`            | 反复“收到不确认就掉线”耗尽尝试次数，判死原因 `DeadMaxAttempts` |
+| `TestGroupRedeliverUnderChurn`    | **失败重投 + 成员上下线 + 并发投递叠加**：阶段 1 拒不确认→死信→巡检重投收敛（重投计数>0）；阶段 2 搅动+多发布者（切换计数>0）；全部恰好确认一次 |
 | `TestGroupConcurrentChurn`        | 3 成员频繁上下线 + 4 发布者 × 50 条：200 条恰好确认一次、同键有序、其他主题不阻塞、`-race` 零竞态 |
 
 单测通过 `t.Logf` 打印关键会话信息（收讫序号、重连续传序号、
